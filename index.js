@@ -1,20 +1,17 @@
-const { 
-  Client, GatewayIntentBits, REST, Routes,
-  SlashCommandBuilder, PermissionFlagsBits,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  ModalBuilder, TextInputBuilder, TextInputStyle,
-  EmbedBuilder
-} = require('discord.js');
+require('dotenv').config();
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
+        ActionRowBuilder, ButtonBuilder, ButtonStyle,
+        ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder,
+        PermissionFlagsBits } = require('discord.js');
 const admin = require('firebase-admin');
 const express = require('express');
-const fetch = require('node-fetch');
 
-// ===== Keep alive for Render =====
+// ====== KEEP ALIVE FOR RENDER =====
 const app = express();
-app.get('/', (req, res) => res.send('Bot Alive'));
-app.listen(process.env.PORT || 3000, () => console.log('Express running'));
+app.get("/", (req, res) => res.send("Bot is alive"));
+app.listen(3000);
 
-// ===== Firebase Init =====
+// ====== FIREBASE SETUP =====
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
 
@@ -24,222 +21,220 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// ===== Discord Client =====
+// ====== BOT CLIENT =====
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent]
 });
 
-// ===== OWNER =====
-const OWNER_ID = 'YOUR_USER_ID_HERE'; // Replace with your Discord ID
-const hiredUsers = new Set(); // Hired users can run commands
+// ====== CONFIG =====
+const OWNER_ID = process.env.OWNER_ID; // YOUR DISCORD ID
+let authorizedUsers = new Set();
+let lockedChannels = new Set(); // stores locked channel IDs
+let activeUserKeys = new Map(); // userID -> key
 
-// ===== Channel Lock System =====
-const lockedChannels = new Set(); // Store locked channels
-
-// ===== COMMANDS =====
+// ====== SLASH COMMANDS =====
 const commands = [
   new SlashCommandBuilder()
     .setName('hire')
-    .setDescription('Hire a user to run bot commands')
-    .addUserOption(opt => opt.setName('user').setDescription('User to hire').setRequired(true)),
+    .setDescription('Authorize a user')
+    .addUserOption(opt => opt.setName('user').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('fire')
-    .setDescription('Remove a hired user')
-    .addUserOption(opt => opt.setName('user').setDescription('User to fire').setRequired(true)),
+    .setDescription('Remove authorization')
+    .addUserOption(opt => opt.setName('user').setRequired(true)),
 
   new SlashCommandBuilder()
     .setName('lock')
-    .setDescription('Lock multiple channels')
-    .addChannelOption(opt => opt.setName('channel1').setDescription('Channel to lock').setRequired(true))
-    .addChannelOption(opt => opt.setName('channel2').setDescription('Optional channel').setRequired(false))
-    .addChannelOption(opt => opt.setName('channel3').setDescription('Optional channel').setRequired(false)),
+    .setDescription('Lock one or more channels')
+    .addChannelOption(opt => opt.setName('channel1').setRequired(true))
+    .addChannelOption(opt => opt.setName('channel2').setRequired(false))
+    .addChannelOption(opt => opt.setName('channel3').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName('keyv')
     .setDescription('Send key redeem panel')
 ];
 
-// ===== REGISTER COMMANDS =====
+// ====== REGISTER COMMANDS =====
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
   const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
-  await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+  await rest.put(
+    Routes.applicationCommands(client.user.id),
+    { body: commands }
+  );
 });
 
-// ===== HELPERS =====
-function formatTime(ts) {
-  return `<t:${Math.floor(ts/1000)}:F> (<t:${Math.floor(ts/1000)}:R>)`;
+// ====== HELPER FUNCTIONS =====
+function formatTime(date) {
+  return `<t:${Math.floor(date.getTime()/1000)}:F>`;
+}
+function formatTimeR(date) {
+  return `<t:${Math.floor(date.getTime()/1000)}:R>`;
 }
 
-function isAuthorized(userId) {
-  return userId === OWNER_ID || hiredUsers.has(userId);
-}
-
-// ===== INTERACTIONS =====
+// ====== INTERACTIONS =====
 client.on('interactionCreate', async interaction => {
-  if (interaction.isChatInputCommand()) {
-    if (!isAuthorized(interaction.user.id)) 
-      return interaction.reply({ content: '❌ Not authorized', ephemeral: true });
 
-    // ===== HIRE =====
-    if (interaction.commandName === 'hire') {
-      const user = interaction.options.getUser('user');
-      hiredUsers.add(user.id);
-      return interaction.reply(`✅ Hired ${user.username}`);
+  // ====== AUTH CHECK =====
+  if(interaction.isChatInputCommand()) {
+    const userId = interaction.user.id;
+    if(userId !== OWNER_ID && !authorizedUsers.has(userId)) {
+      return interaction.reply({ content: "❌ Not authorized", ephemeral: true });
     }
 
-    // ===== FIRE =====
-    if (interaction.commandName === 'fire') {
+    if(interaction.commandName === 'hire') {
       const user = interaction.options.getUser('user');
-      hiredUsers.delete(user.id);
-      return interaction.reply(`❌ Fired ${user.username}`);
+      authorizedUsers.add(user.id);
+      return interaction.reply(`✅ ${user.username} is authorized`);
     }
 
-    // ===== LOCK =====
-    if (interaction.commandName === 'lock') {
-      const channels = [
-        interaction.options.getChannel('channel1'),
-        interaction.options.getChannel('channel2'),
-        interaction.options.getChannel('channel3')
-      ].filter(c => c);
+    if(interaction.commandName === 'fire') {
+      const user = interaction.options.getUser('user');
+      authorizedUsers.delete(user.id);
+      return interaction.reply(`❌ ${user.username} is unauthorized`);
+    }
 
-      for (let c of channels) {
-        lockedChannels.add(c.id);
-        await c.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: false });
+    if(interaction.commandName === 'lock') {
+      const channels = [];
+      ['channel1','channel2','channel3'].forEach(c => {
+        const ch = interaction.options.getChannel(c);
+        if(ch) channels.push(ch);
+      });
+
+      for(const ch of channels) {
+        lockedChannels.add(ch.id);
+        await ch.permissionOverwrites.edit(interaction.guild.roles.everyone, { SendMessages: false });
       }
-
-      return interaction.reply(`🔒 Locked ${channels.map(c=>c.name).join(', ')}`);
+      return interaction.reply({ content: `🔒 Locked ${channels.length} channels`, ephemeral: true });
     }
 
-    // ===== KEYV PANEL =====
-    if (interaction.commandName === 'keyv') {
+    if(interaction.commandName === 'keyv') {
       const button = new ButtonBuilder()
         .setCustomId('redeem')
         .setLabel('Redeem Key')
         .setStyle(ButtonStyle.Primary);
       const row = new ActionRowBuilder().addComponents(button);
 
-      // Send in every locked channel
-      for (let chId of lockedChannels) {
-        const ch = interaction.guild.channels.cache.get(chId);
-        if (ch && ch.isTextBased()) {
-          await ch.send({ content: '🔑 Redeem your key below', components: [row] });
-        }
-      }
-
-      return interaction.reply({ content: 'Panel sent to locked channels', ephemeral: true });
+      return interaction.reply({ content: "🔑 Click to redeem your key", components: [row], ephemeral: true });
     }
   }
 
-  // ===== BUTTON =====
-  if (interaction.isButton() && interaction.customId === 'redeem') {
-    const modal = new ModalBuilder().setCustomId('keyModal').setTitle('Enter your key');
+  // ====== REDEEM BUTTON =====
+  if(interaction.isButton() && interaction.customId === 'redeem') {
+
+    const modal = new ModalBuilder()
+      .setCustomId('keyModal')
+      .setTitle('Enter your key');
+
     const input = new TextInputBuilder()
       .setCustomId('keyInput')
       .setLabel('Your Key')
-      .setStyle(TextInputStyle.Short);
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('Enter key here');
+
     modal.addComponents(new ActionRowBuilder().addComponents(input));
     return interaction.showModal(modal);
   }
 
-  // ===== MODAL SUBMIT =====
-  if (interaction.isModalSubmit() && interaction.customId === 'keyModal') {
+  // ====== MODAL SUBMIT =====
+  if(interaction.isModalSubmit() && interaction.customId === 'keyModal') {
+    const userId = interaction.user.id;
     const key = interaction.fields.getTextInputValue('keyInput');
+
+    if(activeUserKeys.has(userId)) {
+      return interaction.reply({ content: "❌ You already have an active key", ephemeral: true });
+    }
+
     const ref = db.ref('keys/' + key);
     const snap = await ref.once('value');
 
-    if (!snap.exists()) return interaction.reply({ content: '❌ Invalid key', ephemeral: true });
+    if(!snap.exists()) return interaction.reply({ content: "❌ Invalid key", ephemeral: true });
 
     const data = snap.val();
     const now = Date.now();
 
-    if (now > data.expiryRaw) {
+    if(now > data.expiryRaw) {
       await ref.remove();
-      return interaction.reply({ content: '❌ Key expired', ephemeral: true });
+      return interaction.reply({ content: "❌ Key expired", ephemeral: true });
     }
 
-    if (data.used > 0) return interaction.reply({ content: '❌ You already have an active key', ephemeral: true });
+    if(data.used >= data.maxUses) {
+      await ref.remove();
+      return interaction.reply({ content: "❌ Key used up", ephemeral: true });
+    }
 
-    // Lock system: unlock for user
-    for (let chId of lockedChannels) {
+    // mark active
+    activeUserKeys.set(userId, key);
+
+    // unlock locked channels for this user
+    for(const chId of lockedChannels) {
       const ch = interaction.guild.channels.cache.get(chId);
-      if (ch) ch.permissionOverwrites.edit(interaction.user.id, { SendMessages: true });
+      if(ch?.isTextBased()) {
+        await ch.permissionOverwrites.edit(userId, { SendMessages: true });
+      }
     }
 
-    // Mark user used key
-    await ref.update({ used: 1, userId: interaction.user.id });
-
-    // Embed with live countdown
-    const expiry = data.expiryRaw;
+    // send embed with countdown
+    const expiryDate = new Date(data.expiryRaw);
     const embed = new EmbedBuilder()
-      .setTitle('✅ Key Activated')
-      .setDescription(
-`Key: \`${key}\`
-Uses Left: ${data.maxUses - 1}
-Created: ${formatTime(data.createdRaw)}
-Expires: ${formatTime(expiry)}`
-      );
+      .setTitle("✅ Key Activated")
+      .setDescription(`Uses Left: ${data.maxUses - data.used}\nCreated: ${formatTime(new Date(data.createdRaw))}\nExpires: ${formatTime(expiryDate)}\nTime Left: ${formatTimeR(expiryDate)}`)
+      .setColor("Green");
 
-    const msg = await interaction.reply({ embeds: [embed], fetchReply: true });
+    await interaction.reply({ embeds: [embed], ephemeral: true });
 
-    // ===== Realtime countdown =====
+    // start countdown updater
     const interval = setInterval(async () => {
       const snap2 = await ref.once('value');
-      if (!snap2.exists()) {
+      if(!snap2.exists() || (snap2.val().used >= snap2.val().maxUses)) {
         clearInterval(interval);
-        return msg.edit({ embeds: [embed.setDescription('Key deleted')] });
+        activeUserKeys.delete(userId);
+        return;
       }
-
-      const d = snap2.val();
-      const left = d.maxUses - d.used;
-      const timeLeft = d.expiryRaw - Date.now();
-
-      if (left <= 0 || timeLeft <= 0) {
-        // Delete key + lock channels
-        await ref.remove();
-        for (let chId of lockedChannels) {
-          const ch = interaction.guild.channels.cache.get(chId);
-          if (ch) ch.permissionOverwrites.edit(interaction.user.id, { SendMessages: false });
-        }
-        clearInterval(interval);
-        return msg.edit({ embeds: [embed.setDescription('Key expired or used up')] });
-      }
-
-      const newEmbed = EmbedBuilder.from(embed)
-        .setDescription(
-`Key: \`${key}\`
-Uses Left: ${left}
-Created: ${formatTime(d.createdRaw)}
-Expires: ${formatTime(d.expiryRaw)}`
-        );
-      msg.edit({ embeds: [newEmbed] });
+      const data2 = snap2.val();
+      const expiry = new Date(data2.expiryRaw);
+      const embed2 = new EmbedBuilder()
+        .setTitle("✅ Key Activated")
+        .setDescription(`Uses Left: ${data2.maxUses - data2.used}\nCreated: ${formatTime(new Date(data2.createdRaw))}\nExpires: ${formatTime(expiry)}\nTime Left: ${formatTimeR(expiry)}`)
+        .setColor("Green");
+      await interaction.editReply({ embeds: [embed2] });
     }, 1000);
   }
 });
 
-// ===== MESSAGE TRACKER =====
+// ====== MESSAGE TRACKER =====
 client.on('messageCreate', async msg => {
-  if (msg.author.bot) return;
-  if (!lockedChannels.has(msg.channel.id)) return;
+  if(msg.author.bot) return;
 
-  const snapshot = await db.ref('keys').once('value');
-  snapshot.forEach(async child => {
-    const d = child.val();
-    if (d.userId !== msg.author.id) return;
+  // Only track messages in locked channels
+  if(!lockedChannels.has(msg.channel.id)) return;
 
-    let used = d.used + 1;
-    if (used >= d.maxUses) {
-      await child.ref.remove();
-      msg.channel.permissionOverwrites.edit(msg.author.id, { SendMessages: false });
-    } else {
-      await child.ref.update({ used });
+  const userId = msg.author.id;
+  if(!activeUserKeys.has(userId)) return;
+
+  const key = activeUserKeys.get(userId);
+  const ref = db.ref('keys/' + key);
+  const snap = await ref.once('value');
+  if(!snap.exists()) return;
+
+  const data = snap.val();
+  let used = data.used + 1;
+
+  if(used >= data.maxUses) {
+    await ref.remove();
+    activeUserKeys.delete(userId);
+
+    // lock channels again for this user
+    for(const chId of lockedChannels) {
+      const ch = msg.guild.channels.cache.get(chId);
+      if(ch?.isTextBased()) ch.permissionOverwrites.delete(userId);
     }
-  });
+  } else {
+    await ref.update({ used });
+  }
 });
 
 client.login(process.env.TOKEN);
