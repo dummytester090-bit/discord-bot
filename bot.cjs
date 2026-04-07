@@ -2,7 +2,8 @@
 
 require('dotenv').config();
 const { Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
-const { REST, Routes, SlashCommandBuilder } = require('@discordjs/rest');
+const { REST, Routes } = require('@discordjs/rest');
+const { SlashCommandBuilder } = require('@discordjs/builders'); // ✅ Fixed import
 const admin = require('firebase-admin');
 const express = require('express');
 
@@ -64,7 +65,7 @@ async function initializeKeyPanel() {
         const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
         if (!channel) return console.error("Key panel channel not found!");
 
-        // Check for existing panel message
+        // Check if a panel message already exists
         const fetched = await channel.messages.fetch({ limit: 50 });
         keyPanelMessage = fetched.find(m => m.author.id === client.user.id && m.content.startsWith('Active Keys:'));
 
@@ -165,14 +166,12 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.commandName === 'lock') {
         lockedChannels.add(channel.id);
-        // Deny send messages for everyone except users with keys
         channel.permissionOverwrites.set([{ id: interaction.guild.roles.everyone.id, deny: ['SendMessages'] }]);
         interaction.reply(`🔒 Locked ${channel}`);
     }
 
     if (interaction.commandName === 'unlock') {
         lockedChannels.delete(channel.id);
-        // Reset permissions
         channel.permissionOverwrites.set([{ id: interaction.guild.roles.everyone.id, allow: ['SendMessages'] }]);
         interaction.reply(`🔓 Unlocked ${channel}`);
     }
@@ -190,6 +189,5 @@ client.once('ready', async () => {
 // -------------------- Tiny Express Server for Render --------------------
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.get('/', (req, res) => res.send('Bot is running!'));
 app.listen(PORT, () => console.log(`Web server listening on port ${PORT}`));
