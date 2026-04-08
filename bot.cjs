@@ -135,6 +135,7 @@ async function ensureKeyPanel() {
     );
     const newMessage = await channel.send({ content: 'Click the button below to redeem your key:', components: [row] });
     await panelRef.set(newMessage.id);
+    console.log('✅ Key panel created/restored');
     return newMessage;
 }
 
@@ -177,6 +178,36 @@ async function updatePanelContent() {
         await message.edit({ content });
     } catch (error) {
         console.error('Failed to update panel content', error);
+    }
+}
+
+// Periodic check to ensure panel exists (runs every 5 minutes)
+async function periodicPanelCheck() {
+    try {
+        const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
+        if (!channel) return;
+        
+        const panelRef = db.ref('bot/panelMessageId');
+        const messageId = (await panelRef.once('value')).val();
+        
+        if (messageId) {
+            try {
+                await channel.messages.fetch(messageId);
+                // Panel exists, do nothing
+            } catch (error) {
+                // Panel missing, recreate it
+                console.log('Periodic check: Panel missing, recreating...');
+                await panelRef.remove();
+                await ensureKeyPanel();
+                await updatePanelContent();
+            }
+        } else {
+            // No message ID stored, create panel
+            await ensureKeyPanel();
+            await updatePanelContent();
+        }
+    } catch (error) {
+        console.error('Periodic panel check failed:', error);
     }
 }
 
@@ -310,6 +341,11 @@ setInterval(async () => {
     await updatePanelContent();
 }, 60000); // Update every minute
 
+// -------------------- Periodic Panel Recovery (every 5 minutes) --------------------
+setInterval(async () => {
+    await periodicPanelCheck();
+}, 5 * 60 * 1000); // 5 minutes
+
 // -------------------- Slash Command Handling --------------------
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
@@ -368,9 +404,12 @@ client.once('ready', async () => {
         saved.forEach(id => lockedChannels.add(id));
     }
     
-    // Ensure key panel exists
+    // Ensure key panel exists on startup
     keyPanelMessage = await ensureKeyPanel();
     await updatePanelContent();
+    
+    // Also run periodic check immediately to be safe
+    await periodicPanelCheck();
 });
 
 // Save locked channels to DB when modified (optional)
