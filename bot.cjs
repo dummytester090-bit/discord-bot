@@ -8,7 +8,11 @@ const express = require('express');
 
 // -------------------- Discord Bot Setup --------------------
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ],
     partials: [Partials.Channel]
 });
 
@@ -23,7 +27,6 @@ admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: process.env.FIREBASE_DB_URL
 });
-
 const db = admin.database();
 
 // -------------------- Locked Channels --------------------
@@ -41,6 +44,9 @@ const commands = [
         .setName('unlock')
         .setDescription('Unlock a channel')
         .addChannelOption(opt => opt.setName('channel').setDescription('Channel to unlock').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('keyv')
+        .setDescription('Manually send the key redemption panel')
 ].map(cmd => cmd.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -55,17 +61,132 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     }
 })();
 
-// -------------------- Persistent Key Panel --------------------
-let keyPanelMessage;
-const userKeyMessages = new Map(); // Map<userId, Map<key, messageId>>
+// -------------------- Helper Functions --------------------
 
-async function createOrFetchKeyPanel() {
+// Grant send permissions to a user in all locked channels
+async function grantUserPermissions(userId, guild) {
+    for (const chId of lockedChannels) {
+        const channel = guild.channels.cache.get(chId);
+        if (channel) {
+            await channel.permissionOverwrites.edit(userId, { SendMessages: true });
+        }
+    }
+}
+
+// Revoke send permissions from a user in all locked channels
+async function revokeUserPermissions(userId, guild) {
+    for (const chId of lockedChannels) {
+        const channel = guild.channels.cache.get(chId);
+        if (channel) {
+            await channel.permissionOverwrites.delete(userId);
+        }
+    }
+}
+
+// Check if user already has an active key
+async function hasActiveKey(userId) {
+    const snapshot = await db.ref('keys').orderByChild('redeemer').equalTo(userId).once('value');
+    if (!snapshot.exists()) return false;
+    
+    const now = Date.now();
+    for (const keyData of Object.values(snapshot.val())) {
+        if (keyData.expiryRaw > now && keyData.used < keyData.maxUses) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Ensure the key panel message exists (resend if deleted)
+async function ensureKeyPanel() {
     const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
     if (!channel) return console.error("Key panel channel not found!");
 
-    // Check if panel already exists
-    const messages = await channel.messages.fetch({ limit: 50 });
-    keyPanelMessage = messages.find(m => m.author.id === client.user.id && m.content.includes('Click the button below to redeem your key:'));
+    // Get stored message ID from Firebase
+    const panelRef = db.ref('bot/panelMessageId');
+    const snapshot = await panelRef.once('value');
+    let messageId = snapshot.val();
+
+    if (messageId) {
+        try {
+            const message = await channel.messages.fetch(messageId);
+            // Message exists, update button row
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('redeem_key')
+                    .setLabel('Redeem Key')
+                    .setStyle(ButtonStyle.Primary)
+            );
+            await message.edit({ content: 'Click the button below to redeem your key:', components: [row] });
+            return message;
+        } catch (error) {
+            // Message not found, will create new one
+            console.log('Panel message missing, creating new one');
+            await panelRef.remove();
+        }
+    }
+
+    // Create new panel message
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('redeem_key')
+            .setLabel('Redeem Key')
+            .setStyle(ButtonStyle.Primary)
+    );
+    const newMessage = await channel.send({ content: 'Click the button below to redeem your key:', components: [row] });
+    await panelRef.set(newMessage.id);
+    return newMessage;
+}
+
+// Update the panel content with active keys list
+async function updatePanelContent() {
+    const panelRef = db.ref('bot/panelMessageId');
+    const messageId = (await panelRef.once('value')).val();
+    if (!messageId) return;
+
+    const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
+    if (!channel) return;
+
+    try {
+        const message = await channel.messages.fetch(messageId);
+        const snapshot = await db.ref('keys').once('value');
+        let content = '**Active Keys:**\n';
+        let hasActive = false;
+        const now = Date.now();
+
+        for (const [keyId, data] of Object.entries(snapshot.val() || {})) {
+            if (!data.redeemer) continue;
+            
+            if (data.expiryRaw <= now || data.used >= data.maxUses) {
+                // Expired or used up key - remove it
+                await db.ref(`keys/${keyId}`).remove();
+                await revokeUserPermissions(data.redeemer, client.guilds.cache.first()); // Note: assumes single guild
+                continue;
+            }
+            
+            hasActive = true;
+            const minutesLeft = Math.floor((data.expiryRaw - now) / 60000);
+            const usesLeft = data.maxUses - (data.used || 0);
+            content += `<@${data.redeemer}>: ${minutesLeft} min left, ${usesLeft} uses remaining\n`;
+        }
+
+        if (!hasActive) {
+            content = 'No active keys at the moment.';
+        }
+
+        await message.edit({ content });
+    } catch (error) {
+        console.error('Failed to update panel content', error);
+    }
+}
+
+// -------------------- Key Panel Management --------------------
+let keyPanelMessage = null;
+
+// For manual panel sending (/keyv)
+async function sendKeyPanel() {
+    const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
+    if (!channel) return console.error("Key panel channel not found!");
 
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -74,150 +195,162 @@ async function createOrFetchKeyPanel() {
             .setStyle(ButtonStyle.Primary)
     );
 
-    if (!keyPanelMessage) {
-        keyPanelMessage = await channel.send({ content: 'Click the button below to redeem your key:', components: [row] });
-    } else {
-        await keyPanelMessage.edit({ components: [row] });
-    }
+    // Remove existing stored message ID if any
+    await db.ref('bot/panelMessageId').remove();
+    
+    const newMessage = await channel.send({ content: 'Click the button below to redeem your key:', components: [row] });
+    await db.ref('bot/panelMessageId').set(newMessage.id);
+    keyPanelMessage = newMessage;
+    return newMessage;
 }
 
-// -------------------- Message Listener for Key Usage --------------------
+// -------------------- Message Collector for Key Usage --------------------
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
     if (!message.guild) return;
-
-    const snap = await db.ref('keys').orderByChild('redeemer').equalTo(message.author.id).once('value');
-    if (!snap.exists()) return;
-
+    
+    // Only process messages in locked channels
+    if (!lockedChannels.has(message.channel.id)) return;
+    
+    // Check if user has an active key
+    const snapshot = await db.ref('keys').orderByChild('redeemer').equalTo(message.author.id).once('value');
+    if (!snapshot.exists()) return;
+    
+    // Find the active key (not expired, not used up)
     const now = Date.now();
-
-    for (const [key, data] of Object.entries(snap.val())) {
-        if (lockedChannels.has(message.channel.id)) continue;
-
-        const newUsed = (data.used || 0) + 1;
-        if (newUsed >= data.maxUses || now > data.expiryRaw) {
-            await db.ref(`keys/${key}`).remove();
-            // Delete corresponding key info message
-            if (userKeyMessages.has(message.author.id) && userKeyMessages.get(message.author.id).has(key)) {
-                const msgId = userKeyMessages.get(message.author.id).get(key);
-                try {
-                    const channel = await client.channels.fetch(message.channel.id);
-                    const msg = await channel.messages.fetch(msgId);
-                    msg.delete().catch(() => {});
-                } catch {}
-                userKeyMessages.get(message.author.id).delete(key);
-            }
-            message.channel.send(`<@${message.author.id}>, your key ${key} has expired.`);
-        } else {
-            await db.ref(`keys/${key}`).update({ used: newUsed });
+    let activeKey = null;
+    let activeKeyId = null;
+    
+    for (const [keyId, data] of Object.entries(snapshot.val())) {
+        if (data.expiryRaw > now && data.used < data.maxUses) {
+            activeKey = data;
+            activeKeyId = keyId;
+            break;
         }
+    }
+    
+    if (!activeKey) return;
+    
+    // Reduce usage
+    const newUsed = (activeKey.used || 0) + 1;
+    if (newUsed >= activeKey.maxUses) {
+        await db.ref(`keys/${activeKeyId}`).remove();
+        await revokeUserPermissions(message.author.id, message.guild);
+        await message.channel.send(`<@${message.author.id}>, your key has expired.`);
+        await updatePanelContent();
+    } else {
+        await db.ref(`keys/${activeKeyId}`).update({ used: newUsed });
+        await updatePanelContent();
     }
 });
 
 // -------------------- Button Interaction --------------------
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isButton() || interaction.customId !== 'redeem_key') return;
+    if (!interaction.isButton()) return;
 
-    await interaction.reply({ content: 'Please type your key in this channel within 60 seconds.', ephemeral: true });
+    if (interaction.customId === 'redeem_key') {
+        await interaction.reply({ content: 'Please type your key in this channel within 60 seconds.', ephemeral: true });
 
-    const filter = m => m.author.id === interaction.user.id;
-    const collector = interaction.channel.createMessageCollector({ filter, time: 60000, max: 1 });
-
-    collector.on('collect', async m => {
-        const key = m.content.trim();
-        const ref = db.ref('keys/' + key);
-        const snap = await ref.once('value');
-
-        if (!snap.exists()) return interaction.followUp({ content: '❌ Invalid key', ephemeral: true });
-
-        const data = snap.val();
-        const now = Date.now();
-
-        if (data.used >= data.maxUses || now > data.expiryRaw) {
-            await ref.remove();
-            return interaction.followUp({ content: '❌ Key expired or used up', ephemeral: true });
+        // Check if user already has an active key
+        const hasActive = await hasActiveKey(interaction.user.id);
+        if (hasActive) {
+            return interaction.followUp({ content: '❌ You cannot redeem multiple keys at a time. Please use your current key first.', ephemeral: true });
         }
 
-        // Assign redeemer
-        await ref.update({ redeemer: interaction.user.id });
+        const filter = m => m.author.id === interaction.user.id;
+        const collector = interaction.channel.createMessageCollector({ filter, time: 60000, max: 1 });
 
-        // Unlock channels for this user
-        lockedChannels.forEach(chId => {
-            const channel = interaction.guild.channels.cache.get(chId);
-            if (channel) channel.permissionOverwrites.edit(interaction.user.id, { SendMessages: true });
-        });
-
-        // Send key info message
-        const infoMsg = await interaction.channel.send(`<@${interaction.user.id}> redeemed key: ${key}\nRemaining uses: ${data.maxUses - (data.used || 0)}\nExpires in: calculating... minutes`);
-
-        if (!userKeyMessages.has(interaction.user.id)) userKeyMessages.set(interaction.user.id, new Map());
-        userKeyMessages.get(interaction.user.id).set(key, infoMsg.id);
-    });
-});
-
-// -------------------- Countdown Update --------------------
-setInterval(async () => {
-    const now = Date.now();
-
-    for (const [userId, keyMap] of userKeyMessages.entries()) {
-        for (const [key, msgId] of keyMap.entries()) {
+        collector.on('collect', async m => {
+            const key = m.content.trim();
             const ref = db.ref('keys/' + key);
             const snap = await ref.once('value');
+            if (!snap.exists()) return interaction.followUp({ content: '❌ Invalid key', ephemeral: true });
+
             const data = snap.val();
+            const now = Date.now();
 
-            if (!data || !data.redeemer) {
-                // Key deleted: remove message
-                try {
-                    const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
-                    const msg = await channel.messages.fetch(msgId);
-                    msg.delete().catch(() => {});
-                } catch {}
-                keyMap.delete(key);
-                continue;
-            }
-
-            const remainingMs = data.expiryRaw - now;
-            if (remainingMs <= 0) {
+            if (data.used >= data.maxUses || now > data.expiryRaw) {
                 await ref.remove();
-                try {
-                    const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
-                    const msg = await channel.messages.fetch(msgId);
-                    msg.delete().catch(() => {});
-                } catch {}
-                keyMap.delete(key);
-                continue;
+                return interaction.followUp({ content: '❌ Key expired or used up', ephemeral: true });
             }
 
-            const minutesLeft = Math.ceil(remainingMs / 60000);
-            try {
-                const channel = await client.channels.fetch(KEY_PANEL_CHANNEL_ID);
-                const msg = await channel.messages.fetch(msgId);
-                msg.edit(`<@${userId}> redeemed key: ${key}\nRemaining uses: ${data.maxUses - (data.used || 0)}\nExpires in: ${minutesLeft} min`);
-            } catch {}
-        }
+            // Double-check again that user doesn't have active key (race condition)
+            const stillHasActive = await hasActiveKey(interaction.user.id);
+            if (stillHasActive) {
+                return interaction.followUp({ content: '❌ You already have an active key. Please use it first.', ephemeral: true });
+            }
 
-        if (keyMap.size === 0) userKeyMessages.delete(userId);
+            // Assign redeemer
+            await ref.update({ redeemer: interaction.user.id });
+            
+            // Grant permissions in all locked channels
+            await grantUserPermissions(interaction.user.id, interaction.guild);
+            
+            const minutesLeft = Math.floor((data.expiryRaw - now) / 60000);
+            const usesLeft = data.maxUses - (data.used || 0);
+            
+            interaction.followUp({
+                content: `✅ Key valid!\nRemaining uses: ${usesLeft}\nExpires in: ${minutesLeft} minutes`,
+                ephemeral: true
+            });
+            
+            await updatePanelContent();
+        });
+        
+        collector.on('end', collected => {
+            if (collected.size === 0) {
+                interaction.followUp({ content: '⏰ Time expired. Please try again.', ephemeral: true });
+            }
+        });
     }
-}, 10000); // update every 10 seconds
+});
 
-// -------------------- Slash Commands Handling --------------------
+// -------------------- Real-time Countdown Update --------------------
+setInterval(async () => {
+    await updatePanelContent();
+}, 60000); // Update every minute
+
+// -------------------- Slash Command Handling --------------------
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
-    if (interaction.user.id !== OWNER_ID) return interaction.reply({ content: "Only owner can use this!", ephemeral: true });
 
-    const channel = interaction.options.getChannel('channel');
-
-    if (interaction.commandName === 'lock') {
-        lockedChannels.add(channel.id);
-        // Remove send permission for everyone except users with keys
-        channel.permissionOverwrites.set([{ id: interaction.guild.roles.everyone.id, deny: ['SendMessages'] }]);
-        interaction.reply(`🔒 Locked ${channel}`);
+    // Owner-only commands
+    if (interaction.commandName === 'lock' || interaction.commandName === 'unlock') {
+        if (interaction.user.id !== OWNER_ID) {
+            return interaction.reply({ content: "Only owner can use this!", ephemeral: true });
+        }
     }
 
-    if (interaction.commandName === 'unlock') {
+    if (interaction.commandName === 'lock') {
+        const channel = interaction.options.getChannel('channel');
+        lockedChannels.add(channel.id);
+        
+        // Remove send permissions for everyone
+        await channel.permissionOverwrites.set([{ id: interaction.guild.roles.everyone.id, deny: ['SendMessages'] }]);
+        
+        interaction.reply(`🔒 Locked ${channel}`);
+    }
+    
+    else if (interaction.commandName === 'unlock') {
+        const channel = interaction.options.getChannel('channel');
         lockedChannels.delete(channel.id);
-        channel.permissionOverwrites.set([{ id: interaction.guild.roles.everyone.id, allow: ['SendMessages'] }]);
+        
+        // Reset permissions for everyone
+        await channel.permissionOverwrites.set([{ id: interaction.guild.roles.everyone.id, allow: ['SendMessages'] }]);
+        
+        // Also remove all user-specific overwrites in this channel
+        const overwrites = channel.permissionOverwrites.cache.filter(over => over.type === 'member');
+        for (const overwrite of overwrites.values()) {
+            await channel.permissionOverwrites.delete(overwrite.id);
+        }
+        
         interaction.reply(`🔓 Unlocked ${channel}`);
+    }
+    
+    else if (interaction.commandName === 'keyv') {
+        await interaction.deferReply({ ephemeral: true });
+        await sendKeyPanel();
+        await interaction.editReply({ content: '✅ Key panel has been sent/updated!', ephemeral: true });
     }
 });
 
@@ -227,11 +360,41 @@ client.login(process.env.DISCORD_TOKEN);
 // -------------------- On Ready --------------------
 client.once('ready', async () => {
     console.log(`Logged in as ${client.user.tag}!`);
-    await createOrFetchKeyPanel();
+    // Load locked channels from database (optional persistence)
+    const lockedRef = db.ref('bot/lockedChannels');
+    const snapshot = await lockedRef.once('value');
+    if (snapshot.exists()) {
+        const saved = snapshot.val();
+        saved.forEach(id => lockedChannels.add(id));
+    }
+    
+    // Ensure key panel exists
+    keyPanelMessage = await ensureKeyPanel();
+    await updatePanelContent();
 });
+
+// Save locked channels to DB when modified (optional)
+async function saveLockedChannels() {
+    await db.ref('bot/lockedChannels').set(Array.from(lockedChannels));
+}
+
+// Override add/delete to save
+const origAdd = lockedChannels.add.bind(lockedChannels);
+lockedChannels.add = (...args) => {
+    const result = origAdd(...args);
+    saveLockedChannels();
+    return result;
+};
+const origDelete = lockedChannels.delete.bind(lockedChannels);
+lockedChannels.delete = (...args) => {
+    const result = origDelete(...args);
+    saveLockedChannels();
+    return result;
+};
 
 // -------------------- Tiny Express Server for Render --------------------
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 app.get('/', (req, res) => res.send('Bot is running!'));
 app.listen(PORT, () => console.log(`Web server listening on port ${PORT}`));
